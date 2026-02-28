@@ -21,6 +21,8 @@ from PyQt6.QtWidgets import (
     QSlider,
     QSpinBox,
     QStatusBar,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -110,8 +112,36 @@ class CheckListWidget(QListWidget):
         super().mousePressEvent(event)
 
 
+class SourceTreeWidget(QTreeWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setHeaderHidden(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+
+    def mousePressEvent(self, event):  # type: ignore[override]
+        item = self.itemAt(event.pos())
+        if (
+            item is not None
+            and self.isEnabled()
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            item.setCheckState(
+                0,
+                Qt.CheckState.Unchecked
+                if item.checkState(0) == Qt.CheckState.Checked
+                else Qt.CheckState.Checked,
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class MainWindow(QMainWindow):
     USER_ROLE = int(Qt.ItemDataRole.UserRole)
+    TITLE_ROLE = USER_ROLE + 1
+    NAME_ROLE = USER_ROLE + 2
+    APP_ROLE = USER_ROLE + 3
+    APP_MARKER_ROLE = USER_ROLE + 4
     # Internal exclude lists: add exact node keys (node.name values) here.
     EXCLUDED_SOURCE_KEYS: list[str] = [
         "input.audiolink_virtual_mic",
@@ -142,10 +172,9 @@ class MainWindow(QMainWindow):
         self._virtual_mic_source_key = self.controller.virtual_mic_source_key()
         self._pending_virtual_mic_percent: float = 100.0
         self._cfg: AppConfig = load_config()
-        self._auto_select_source_keys: set[str] = set(self._cfg.auto_select_sources)
-        self._auto_select_target_keys: set[str] = set(self._cfg.auto_select_targets)
-        self.state.selected_sources.update(self._auto_select_source_keys)
-        self.state.selected_targets.update(self._auto_select_target_keys)
+        self._auto_select_source_apps: set[str] = set(self._cfg.auto_select_sources)
+        self._auto_select_source_items: set[str] = set(self._cfg.auto_select_source_items)
+        self._auto_select_target_names: set[str] = set(self._cfg.auto_select_targets)
 
         self.setWindowTitle("AudioLink")
         self.resize(800, 600)
@@ -207,7 +236,7 @@ class MainWindow(QMainWindow):
         source_layout = QVBoxLayout(source_group)
         target_layout = QVBoxLayout(target_group)
 
-        self.sources_list = CheckListWidget()
+        self.sources_list = SourceTreeWidget()
         self.targets_list = CheckListWidget()
         self.sources_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.targets_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -262,10 +291,10 @@ class MainWindow(QMainWindow):
         self.sources_list.itemChanged.connect(self._on_source_item_changed)
         self.targets_list.itemChanged.connect(self._on_target_item_changed)
         self.sources_list.customContextMenuRequested.connect(
-            lambda pos: self._open_item_menu(self.sources_list, pos, source_list=True)
+            lambda pos: self._open_source_item_menu(pos)
         )
         self.targets_list.customContextMenuRequested.connect(
-            lambda pos: self._open_item_menu(self.targets_list, pos, source_list=False)
+            lambda pos: self._open_target_item_menu(pos)
         )
         self.toggle_streaming_btn.toggled.connect(self._toggle_streaming)
         self.clear_capturing_btn.clicked.connect(self._clear_capturing)
@@ -316,6 +345,23 @@ class MainWindow(QMainWindow):
             sources=sources,
             targets=targets,
         )
+        for key, node in self.state.available_sources.items():
+            app_name = self._source_group_name(node)
+            app_marker = self._source_group_marker(node)
+            marker = self._source_item_marker(
+                app_marker=app_marker,
+                title=(node.media_name or node.description or node.name),
+                raw_name=node.name,
+            )
+            if (
+                app_marker in self._auto_select_source_apps
+                or app_name in self._auto_select_source_apps  # backward compatibility with older config values
+                or marker in self._auto_select_source_items
+            ):
+                self.state.selected_sources.add(key)
+        for key, node in self.state.available_targets.items():
+            if node.name in self._auto_select_target_names:
+                self.state.selected_targets.add(key)
 
         self._refresh_lists()
         self._apply_routing_actions()
@@ -333,23 +379,18 @@ class MainWindow(QMainWindow):
     def _refresh_lists(self) -> None:
         self._updating_lists = True
         try:
-            self.sources_list.clear()
-            for entry in self.state.source_entries():
-                node = self.state.available_sources.get(entry.key)
-                label = f"{entry.label} [auto]" if entry.key in self._auto_select_source_keys else entry.label
-                item = QListWidgetItem(label)
-                item.setData(self.USER_ROLE, entry.key)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(Qt.CheckState.Checked if entry.selected else Qt.CheckState.Unchecked)
-                if not entry.available:
-                    item.setBackground(self.not_available_color)
-                self.sources_list.addItem(item)
+            self._refresh_source_tree()
 
             self.targets_list.clear()
             for entry in self.state.target_entries():
-                label = f"{entry.label} [auto]" if entry.key in self._auto_select_target_keys else entry.label
+                node = self.state.available_targets.get(entry.key)
+                label = self._target_display_label(node, entry.label)
+                if node is not None and node.name in self._auto_select_target_names:
+                    label = f"{label} [auto]"
                 item = QListWidgetItem(label)
                 item.setData(self.USER_ROLE, entry.key)
+                item.setData(self.TITLE_ROLE, label)
+                item.setData(self.NAME_ROLE, node.name if node is not None else entry.key)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Checked if entry.selected else Qt.CheckState.Unchecked)
                 if not entry.available:
@@ -361,6 +402,94 @@ class MainWindow(QMainWindow):
         self.sources_list.setEnabled(not self.state.auto_capture)
         self.targets_list.setEnabled(not self.state.auto_streaming)
 
+    def _refresh_source_tree(self) -> None:
+        self.sources_list.clear()
+        grouped: dict[str, list[tuple[str, str, bool, bool]]] = {}
+        group_labels: dict[str, str] = {}
+        for entry in self.state.source_entries():
+            node = self.state.available_sources.get(entry.key)
+            app_name = self._source_group_name(node) if node is not None else "Unavailable"
+            app_marker = self._source_group_marker(node) if node is not None else f"missing:{entry.key}"
+            grouped.setdefault(app_marker, []).append((entry.key, entry.label, entry.available, entry.selected))
+            group_labels[app_marker] = app_name
+
+        for app_marker in sorted(grouped.keys(), key=str.lower):
+            app_name = group_labels.get(app_marker, app_marker)
+            group_items = sorted(grouped[app_marker], key=lambda x: x[1].lower())
+            if len(group_items) == 1:
+                key, child_label, available, selected = group_items[0]
+                node = self.state.available_sources.get(key)
+                label = f"{app_name} - {child_label}" if child_label and child_label != app_name else app_name
+                item_marker = self._source_item_marker(
+                    app_marker=app_marker,
+                    title=(child_label or app_name),
+                    raw_name=(node.name if node is not None else key),
+                )
+                if (
+                    app_marker in self._auto_select_source_apps
+                    or app_name in self._auto_select_source_apps  # backward compatibility with older config values
+                    or item_marker in self._auto_select_source_items
+                ):
+                    label = f"{label} [auto]"
+                leaf = QTreeWidgetItem([label])
+                leaf.setData(0, self.USER_ROLE, key)
+                leaf.setData(0, self.TITLE_ROLE, child_label or app_name)
+                leaf.setData(0, self.NAME_ROLE, node.name if node is not None else key)
+                leaf.setData(0, self.APP_ROLE, app_name)
+                leaf.setData(0, self.APP_MARKER_ROLE, app_marker)
+                leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                leaf.setCheckState(0, Qt.CheckState.Checked if selected else Qt.CheckState.Unchecked)
+                if not available:
+                    leaf.setBackground(0, self.not_available_color)
+                self.sources_list.addTopLevelItem(leaf)
+                continue
+
+            parent_label = (
+                f"{app_name} [auto]"
+                if (app_marker in self._auto_select_source_apps or app_name in self._auto_select_source_apps)
+                else app_name
+            )
+            parent = QTreeWidgetItem([parent_label])
+            parent.setData(0, self.USER_ROLE, app_marker)
+            parent.setData(0, self.TITLE_ROLE, app_name)
+            parent.setData(0, self.NAME_ROLE, app_name)
+            parent.setData(0, self.APP_ROLE, app_name)
+            parent.setData(0, self.APP_MARKER_ROLE, app_marker)
+            parent.setFlags(parent.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            self.sources_list.addTopLevelItem(parent)
+
+            child_states: list[Qt.CheckState] = []
+            for key, label, available, selected in group_items:
+                node = self.state.available_sources.get(key)
+                item_marker = self._source_item_marker(
+                    app_marker=app_marker,
+                    title=label,
+                    raw_name=(node.name if node is not None else key),
+                )
+                child_label = f"{label} [auto]" if item_marker in self._auto_select_source_items else label
+                child = QTreeWidgetItem([label])
+                child.setData(0, self.USER_ROLE, key)
+                child.setData(0, self.TITLE_ROLE, label)
+                child.setText(0, child_label)
+                child.setData(0, self.NAME_ROLE, node.name if node is not None else key)
+                child.setData(0, self.APP_ROLE, app_name)
+                child.setData(0, self.APP_MARKER_ROLE, app_marker)
+                child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                state = Qt.CheckState.Checked if selected else Qt.CheckState.Unchecked
+                child.setCheckState(0, state)
+                child_states.append(state)
+                if not available:
+                    child.setBackground(0, self.not_available_color)
+                parent.addChild(child)
+
+            if child_states and all(s == Qt.CheckState.Checked for s in child_states):
+                parent.setCheckState(0, Qt.CheckState.Checked)
+            elif any(s == Qt.CheckState.Checked for s in child_states):
+                parent.setCheckState(0, Qt.CheckState.PartiallyChecked)
+            else:
+                parent.setCheckState(0, Qt.CheckState.Unchecked)
+            parent.setExpanded(True)
+
     def _apply_routing_actions(self) -> None:
         actions = self.state.compute_actions(
             self.snapshot,
@@ -368,6 +497,11 @@ class MainWindow(QMainWindow):
             virtual_source_key=self._virtual_mic_source_key,
         )
         if actions:
+            self._logger.debug(
+                "Dispatching %d routing action(s): %s",
+                len(actions),
+                ", ".join(f"{a.op}:{a.source_key}->{a.target_key}" for a in actions[:8]),
+            )
             self.request_apply_actions.emit(actions)
 
     def _apply_actions_sync(self, actions: list[RouteAction]) -> None:
@@ -399,10 +533,49 @@ class MainWindow(QMainWindow):
                 keys.add(key)
         return keys
 
-    def _on_source_item_changed(self, _item: QListWidgetItem) -> None:
+    def _on_source_item_changed(self, item: QTreeWidgetItem, _column: int) -> None:
         if self._updating_lists:
             return
-        self.state.set_source_selection(self._checked_keys(self.sources_list))
+        self._updating_lists = True
+        try:
+            if item.parent() is None and item.childCount() > 0:
+                desired = item.checkState(0)
+                if desired == Qt.CheckState.PartiallyChecked:
+                    desired = Qt.CheckState.Checked
+                for i in range(item.childCount()):
+                    child = item.child(i)
+                    child.setCheckState(0, desired)
+            elif item.parent() is not None:
+                parent = item.parent()
+                checked = 0
+                for i in range(parent.childCount()):
+                    if parent.child(i).checkState(0) == Qt.CheckState.Checked:
+                        checked += 1
+                if checked == 0:
+                    parent.setCheckState(0, Qt.CheckState.Unchecked)
+                elif checked == parent.childCount():
+                    parent.setCheckState(0, Qt.CheckState.Checked)
+                else:
+                    parent.setCheckState(0, Qt.CheckState.PartiallyChecked)
+        finally:
+            self._updating_lists = False
+
+        selected: set[str] = set()
+        for i in range(self.sources_list.topLevelItemCount()):
+            parent = self.sources_list.topLevelItem(i)
+            if parent.childCount() == 0:
+                if parent.checkState(0) == Qt.CheckState.Checked:
+                    key = parent.data(0, self.USER_ROLE)
+                    if isinstance(key, str):
+                        selected.add(key)
+                continue
+            for j in range(parent.childCount()):
+                child = parent.child(j)
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    key = child.data(0, self.USER_ROLE)
+                    if isinstance(key, str):
+                        selected.add(key)
+        self.state.set_source_selection(selected)
         self._apply_routing_actions()
 
     def _on_target_item_changed(self, _item: QListWidgetItem) -> None:
@@ -471,33 +644,102 @@ class MainWindow(QMainWindow):
     def _flush_virtual_mic_percent(self) -> None:
         self.request_set_virtual_mic_volume.emit(self._pending_virtual_mic_percent)
 
-    def _open_item_menu(self, widget: QListWidget, pos, source_list: bool) -> None:
-        item = widget.itemAt(pos)
+    def _open_source_item_menu(self, pos) -> None:
+        item = self.sources_list.itemAt(pos)
         if item is None:
             return
-        key = item.data(self.USER_ROLE)
+        key = item.data(0, self.USER_ROLE)
+        title = item.data(0, self.TITLE_ROLE)
+        raw_name = item.data(0, self.NAME_ROLE)
         if not isinstance(key, str):
             return
-
-        auto_set = self._auto_select_source_keys if source_list else self._auto_select_target_keys
+        if not isinstance(title, str):
+            title = key
+        if not isinstance(raw_name, str):
+            raw_name = key
+        is_group = item.parent() is None and item.childCount() > 0
+        group_child_keys: list[str] = []
+        if is_group:
+            for i in range(item.childCount()):
+                child = item.child(i)
+                child_key = child.data(0, self.USER_ROLE)
+                if isinstance(child_key, str):
+                    group_child_keys.append(child_key)
+        app_name = item.data(0, self.APP_ROLE)
+        if not isinstance(app_name, str):
+            app_name = self._source_group_name(self.state.available_sources.get(key))
+        app_marker = item.data(0, self.APP_MARKER_ROLE)
+        if not isinstance(app_marker, str):
+            app_marker = app_name
+        auto_set = self._auto_select_source_apps
+        auto_item_set = self._auto_select_source_items
         menu = QMenu(self)
         copy_name_action = menu.addAction("Copy Name")
         menu.addSeparator()
-        toggle_label = "Unmark Auto Select" if key in auto_set else "Mark Auto Select"
+        marker_key = app_marker
+        item_marker = self._source_item_marker(app_marker=app_marker, title=title, raw_name=raw_name)
+        if is_group:
+            marked = marker_key in auto_set or app_name in auto_set
+        else:
+            marked = item_marker in auto_item_set
+        toggle_label = "Unmark Auto Select" if marked else "Mark Auto Select"
         toggle_auto_action = menu.addAction(toggle_label)
 
-        chosen = menu.exec(widget.viewport().mapToGlobal(pos))
+        chosen = menu.exec(self.sources_list.viewport().mapToGlobal(pos))
         if chosen is copy_name_action:
-            QApplication.clipboard().setText(key)
+            QApplication.clipboard().setText(app_name if is_group else raw_name)
         elif chosen is toggle_auto_action:
-            if key in auto_set:
-                auto_set.remove(key)
-            else:
-                auto_set.add(key)
-                if source_list:
-                    self.state.selected_sources.add(key)
+            if is_group:
+                if marker_key in auto_set:
+                    auto_set.remove(marker_key)
                 else:
-                    self.state.selected_targets.add(key)
+                    auto_set.add(marker_key)
+                # Cleanup legacy value if present to avoid dual markers in config.
+                auto_set.discard(app_name)
+            else:
+                if item_marker in auto_item_set:
+                    auto_item_set.remove(item_marker)
+                else:
+                    auto_item_set.add(item_marker)
+                    self.state.selected_sources.add(key)
+            if is_group:
+                for child_key in group_child_keys:
+                    self.state.selected_sources.add(child_key)
+            else:
+                self.state.selected_sources.add(key)
+            self._save_config()
+            self._refresh_lists()
+
+    def _open_target_item_menu(self, pos) -> None:
+        item = self.targets_list.itemAt(pos)
+        if item is None:
+            return
+        key = item.data(self.USER_ROLE)
+        raw_name = item.data(self.NAME_ROLE)
+        if not isinstance(key, str):
+            return
+        if not isinstance(raw_name, str):
+            raw_name = key
+
+        marker_key = raw_name
+        auto_set = self._auto_select_target_names
+        menu = QMenu(self)
+        copy_name_action = menu.addAction("Copy Name")
+        menu.addSeparator()
+        toggle_label = "Unmark Auto Select" if marker_key in auto_set else "Mark Auto Select"
+        toggle_auto_action = menu.addAction(toggle_label)
+
+        chosen = menu.exec(self.targets_list.viewport().mapToGlobal(pos))
+        if chosen is copy_name_action:
+            QApplication.clipboard().setText(raw_name)
+        elif chosen is toggle_auto_action:
+            if marker_key in auto_set:
+                auto_set.remove(marker_key)
+            else:
+                auto_set.add(marker_key)
+                for cur_key, node in self.state.available_targets.items():
+                    if node.name == marker_key:
+                        self.state.selected_targets.add(cur_key)
             self._save_config()
             self._refresh_lists()
 
@@ -505,12 +747,55 @@ class MainWindow(QMainWindow):
         try:
             save_config(
                 AppConfig(
-                    auto_select_sources=set(self._auto_select_source_keys),
-                    auto_select_targets=set(self._auto_select_target_keys),
+                    auto_select_sources=set(self._auto_select_source_apps),
+                    auto_select_source_items=set(self._auto_select_source_items),
+                    auto_select_targets=set(self._auto_select_target_names),
                 )
             )
         except OSError as exc:
             self._logger.warning("Failed to save config.json: %s", exc)
+
+    @staticmethod
+    def _source_group_name(node) -> str:
+        if node is None:
+            return "Unavailable"
+        app = (node.application_name or "").strip()
+        if app:
+            return app
+        if node.process_id is not None:
+            return f"PID {node.process_id}"
+        return node.description or node.name
+
+    @staticmethod
+    def _source_group_marker(node) -> str:
+        if node is None:
+            return "unavailable"
+        app = (node.application_name or "").strip()
+        if app and node.process_id is not None:
+            return f"app:{app}|pid:{node.process_id}"
+        if app:
+            return f"app:{app}"
+        if node.process_id is not None:
+            return f"pid:{node.process_id}"
+        return f"name:{node.name}"
+
+    @staticmethod
+    def _target_display_label(node, fallback_label: str) -> str:
+        if node is None:
+            return fallback_label
+        app = (node.application_name or "").strip()
+        stream = (node.media_name or "").strip()
+        if app and stream and stream.lower() != app.lower():
+            return f"{app} - {stream}"
+        if app:
+            return app
+        if stream:
+            return stream
+        return fallback_label
+
+    @staticmethod
+    def _source_item_marker(app_marker: str, title: str, raw_name: str) -> str:
+        return "|".join([app_marker.strip(), title.strip(), raw_name.strip()])
 
     def load_media_file(self, file_path: str) -> None:
         path = Path(file_path).expanduser().resolve()

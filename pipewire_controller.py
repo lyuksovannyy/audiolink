@@ -26,6 +26,8 @@ class Node:
     id: int
     name: str
     description: str
+    application_name: str
+    media_name: str
     media_class: str
     process_id: int | None
     ports: List[Port] = field(default_factory=list)
@@ -78,6 +80,7 @@ class PipeWireController:
         self._logger = logging.getLogger("audiolink.pipewire")
         self._require_command("pw-dump")
         self._require_command("pw-link")
+        self._require_command("pw-cli")
         self._require_command("pactl")
         self._virtual_sink_module_id: int | None = None
         self._virtual_source_module_id: int | None = None
@@ -151,6 +154,8 @@ class PipeWireController:
                     id=obj_id,
                     name=str(node_name),
                     description=str(desc),
+                    application_name=str(props.get("application.name", "")),
+                    media_name=str(props.get("media.name") or ""),
                     media_class=str(media_class),
                     process_id=pid,
                 )
@@ -163,6 +168,10 @@ class PipeWireController:
                     or props.get("direction")
                     or props.get("port.direction")
                 )
+                if direction == "output":
+                    direction = "out"
+                elif direction == "input":
+                    direction = "in"
                 node_id = self._as_int(
                     info.get("node.id")
                     or props.get("node.id")
@@ -172,8 +181,8 @@ class PipeWireController:
                     continue
 
                 port_name = (
-                    props.get("port.alias")
-                    or props.get("port.name")
+                    props.get("port.name")
+                    or props.get("port.alias")
                     or props.get("object.path")
                     or f"port-{obj_id}"
                 )
@@ -239,7 +248,7 @@ class PipeWireController:
     def create_link(self, source: Node, sink: Node) -> None:
         source_port = self._pick_audio_port(source.output_ports)
         sink_port = self._pick_audio_port(sink.input_ports)
-        self._run(["pw-link", f"{source.name}:{source_port.name}", f"{sink.name}:{sink_port.name}"])
+        self._create_link_persistent(source, source_port, sink, sink_port)
 
     def remove_link(self, source: Node, sink: Node) -> None:
         source_port = self._pick_audio_port(source.output_ports)
@@ -247,7 +256,12 @@ class PipeWireController:
         self._run(["pw-link", "-d", f"{source.name}:{source_port.name}", f"{sink.name}:{sink_port.name}"])
 
     def remove_link_by_ports(self, output_port: Port, input_port: Port) -> None:
-        self._run(["pw-link", "-d", f"{output_port.node_name}:{output_port.name}", f"{input_port.node_name}:{input_port.name}"])
+        try:
+            self._run(["pw-link", "-d", f"{output_port.node_name}:{output_port.name}", f"{input_port.node_name}:{input_port.name}"])
+        except PipeWireError as exc:
+            if self._is_unlink_missing_error(str(exc)):
+                return
+            raise
 
     def is_linked(self, source: Node, sink: Node, snapshot: PipeWireSnapshot) -> bool:
         out_ids = {p.id for p in source.output_ports}
@@ -332,12 +346,53 @@ class PipeWireController:
     def create_link_by_key(self, source_key: str, target_key: str, snapshot: PipeWireSnapshot) -> None:
         source = self._find_node_by_key(source_key, snapshot, source=True)
         target = self._find_node_by_key(target_key, snapshot, source=False)
-        self.create_link(source, target)
+        existing_pairs = {
+            (link.output_port_id, link.input_port_id)
+            for link in snapshot.links
+            if link.output_node_id == source.id and link.input_node_id == target.id
+        }
+
+        pairs = self._select_port_pairs(source.output_ports, target.input_ports)
+        self._logger.debug(
+            "create_link_by_key resolved: %s -> %s | src(node=%s) dst(node=%s) pair_count=%d",
+            source_key,
+            target_key,
+            source.id,
+            target.id,
+            len(pairs),
+        )
+        for out_port, in_port in pairs:
+            if (out_port.id, in_port.id) in existing_pairs:
+                continue
+            try:
+                self._create_link_persistent(source, out_port, target, in_port)
+            except PipeWireError as exc:
+                if self._is_link_exists_error(str(exc)):
+                    continue
+                raise
 
     def remove_link_by_key(self, source_key: str, target_key: str, snapshot: PipeWireSnapshot) -> None:
         source = self._find_node_by_key(source_key, snapshot, source=True)
         target = self._find_node_by_key(target_key, snapshot, source=False)
-        self.remove_link(source, target)
+        self._logger.debug(
+            "remove_link_by_key resolved: %s -> %s | src(node=%s) dst(node=%s)",
+            source_key,
+            target_key,
+            source.id,
+            target.id,
+        )
+        matching = [
+            link
+            for link in snapshot.links
+            if link.output_node_id == source.id and link.input_node_id == target.id
+        ]
+        for link in matching:
+            try:
+                self._run(["pw-cli", "destroy", str(link.id)])
+            except PipeWireError as exc:
+                if self._is_unlink_missing_error(str(exc)):
+                    continue
+                raise
 
     def set_volume_by_keys(self, source_keys: List[str], snapshot: PipeWireSnapshot, percent: int) -> None:
         if not self._has_command("wpctl"):
@@ -345,9 +400,10 @@ class PipeWireController:
 
         volume = max(0, min(100, percent)) / 100.0
         by_name = {n.name: n for n in snapshot.sources}
+        by_id = {f"source:{n.id}": n for n in snapshot.sources}
         errors: list[str] = []
         for key in source_keys:
-            node = by_name.get(key)
+            node = by_id.get(key) or by_name.get(key)
             if node is None:
                 continue
             try:
@@ -370,9 +426,10 @@ class PipeWireController:
         linear = clamped / 100.0
 
         by_name = {n.name: n for n in snapshot.sinks}
+        by_id = {f"target:{n.id}": n for n in snapshot.sinks}
         errors: list[str] = []
         for key in target_keys:
-            node = by_name.get(key)
+            node = by_id.get(key) or by_name.get(key)
             if node is None:
                 continue
             try:
@@ -384,6 +441,22 @@ class PipeWireController:
 
     def _find_node_by_key(self, key: str, snapshot: PipeWireSnapshot, source: bool) -> Node:
         candidates = snapshot.sources if source else snapshot.sinks
+        if source and key.startswith("source:"):
+            try:
+                source_id = int(key.split(":", 1)[1])
+            except ValueError:
+                source_id = -1
+            for node in candidates:
+                if node.id == source_id:
+                    return node
+        if (not source) and key.startswith("target:"):
+            try:
+                target_id = int(key.split(":", 1)[1])
+            except ValueError:
+                target_id = -1
+            for node in candidates:
+                if node.id == target_id:
+                    return node
         for node in candidates:
             if node.name == key:
                 return node
@@ -501,6 +574,74 @@ class PipeWireController:
             if "audio" in low or "monitor" in low or "playback" in low or "capture" in low:
                 return p
         return ports[0]
+
+    @staticmethod
+    def _select_port_pairs(output_ports: List[Port], input_ports: List[Port]) -> List[tuple[Port, Port]]:
+        if not output_ports or not input_ports:
+            raise PipeWireError("No compatible ports available")
+
+        def normalize(name: str) -> str:
+            return name.strip().lower()
+
+        out_by_name = {normalize(p.name): p for p in output_ports}
+        in_by_name = {normalize(p.name): p for p in input_ports}
+
+        preferred_patterns = [
+            ("output_fl", "input_fl"),
+            ("output_fr", "input_fr"),
+            ("capture_fl", "input_fl"),
+            ("capture_fr", "input_fr"),
+            ("output_fl", "playback_fl"),
+            ("output_fr", "playback_fr"),
+            ("capture_fl", "playback_fl"),
+            ("capture_fr", "playback_fr"),
+        ]
+
+        pairs: list[tuple[Port, Port]] = []
+        for out_key, in_key in preferred_patterns:
+            out_port = out_by_name.get(out_key)
+            in_port = in_by_name.get(in_key)
+            if out_port is not None and in_port is not None:
+                pairs.append((out_port, in_port))
+
+        if pairs:
+            return pairs
+
+        # Fallback: deterministic single pair based on sorted names.
+        out_sorted = sorted(output_ports, key=lambda p: p.name.lower())
+        in_sorted = sorted(input_ports, key=lambda p: p.name.lower())
+        return [(out_sorted[0], in_sorted[0])]
+
+    @staticmethod
+    def _is_unlink_missing_error(message: str) -> bool:
+        low = message.lower()
+        return ("no such file or directory" in low) or ("not found" in low)
+
+    @staticmethod
+    def _is_link_exists_error(message: str) -> bool:
+        return "file exists" in message.lower()
+
+    def _create_link_persistent(self, source: Node, out_port: Port, target: Node, in_port: Port) -> None:
+        # Prefer pw-link by port IDs to create lingering links while staying stream-precise.
+        # Falls back to pw-cli for environments where numeric ID linking is unsupported.
+        try:
+            self._run(["pw-link", str(out_port.id), str(in_port.id)])
+            return
+        except PipeWireError as exc:
+            if self._is_link_exists_error(str(exc)):
+                return
+            self._logger.debug("pw-link by id failed, falling back to pw-cli create-link: %s", exc)
+
+        self._run(
+            [
+                "pw-cli",
+                "create-link",
+                str(source.id),
+                str(out_port.id),
+                str(target.id),
+                str(in_port.id),
+            ]
+        )
 
     @staticmethod
     def _parse_module_id(raw: str, module_name: str) -> int:

@@ -38,8 +38,8 @@ class RoutingStateManager:
         self._desired_pairs: set[tuple[str, str]] = set()
 
     def update_available(self, sources: list[Node], targets: list[Node]) -> None:
-        self.available_sources = {self._key(n): n for n in sources}
-        self.available_targets = {self._key(n): n for n in targets}
+        self.available_sources = {self._source_key(n): n for n in sources}
+        self.available_targets = {self._target_key(n): n for n in targets}
 
         for key, node in self.available_sources.items():
             self._source_labels[key] = self._label(node)
@@ -96,8 +96,8 @@ class RoutingStateManager:
         virtual_source_key: str | None = None,
     ) -> list[RouteAction]:
         linked_pairs = self._linked_pairs(snapshot)
-        available_snapshot_sources = {self._key(n) for n in snapshot.sources}
-        available_snapshot_targets = {self._key(n) for n in snapshot.sinks}
+        available_snapshot_sources = {self._source_key(n) for n in snapshot.sources}
+        available_snapshot_targets = {self._target_key(n) for n in snapshot.sinks}
 
         source_pool = set(self.available_sources.keys()) if self.auto_capture else set(self.selected_sources)
         target_pool = set(self.available_targets.keys()) if self.auto_streaming else set(self.selected_targets)
@@ -177,12 +177,13 @@ class RoutingStateManager:
 
     def _linked_pairs(self, snapshot: PipeWireSnapshot) -> set[tuple[str, str]]:
         nodes = snapshot.nodes
-        by_id = {node.id: self._key(node) for node in nodes.values()}
+        by_id_source = {node.id: self._source_key(node) for node in nodes.values()}
+        by_id_target = {node.id: self._target_key(node) for node in nodes.values()}
         linked: set[tuple[str, str]] = set()
 
         for link in snapshot.links:
-            source_key = by_id.get(link.output_node_id)
-            target_key = by_id.get(link.input_node_id)
+            source_key = by_id_source.get(link.output_node_id)
+            target_key = by_id_target.get(link.input_node_id)
             if source_key is None or target_key is None:
                 continue
             linked.add((source_key, target_key))
@@ -190,9 +191,23 @@ class RoutingStateManager:
         return linked
 
     @staticmethod
-    def _key(node: Node) -> str:
+    def _source_key(node: Node) -> str:
+        media_class = (node.media_class or "").lower()
+        # Keep app stream nodes unique, but keep device/virtual sources name-keyed
+        # so virtual mic bridge links can be tracked correctly.
+        if media_class.startswith("stream/output/audio"):
+            return f"source:{node.id}"
+        return node.name
+
+    @staticmethod
+    def _target_key(node: Node) -> str:
+        media_class = (node.media_class or "").lower()
+        if media_class.startswith("stream/input/audio"):
+            return f"target:{node.id}"
         return node.name
 
     @staticmethod
     def _label(node: Node) -> str:
+        if node.media_name:
+            return node.media_name
         return node.description
