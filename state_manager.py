@@ -195,4 +195,4 @@ class RoutingStateManager:
 
     @staticmethod
     def _label(node: Node) -> str:
-        return f"{node.description} [{node.name}]"
+        return node.description

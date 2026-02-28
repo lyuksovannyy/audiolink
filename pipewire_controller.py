@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
-import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -359,15 +357,17 @@ class PipeWireController:
         if errors:
             raise PipeWireError("; ".join(errors[:3]))
 
-    def apply_target_db_offset_by_keys(
+    def apply_target_volume_percent_by_keys(
         self,
         target_keys: List[str],
         snapshot: PipeWireSnapshot,
-        desired_db: float,
-        baselines: Dict[str, float],
+        percent: float,
     ) -> None:
         if not self._has_command("wpctl"):
-            raise PipeWireError("Missing required command for target dB offset control: wpctl")
+            raise PipeWireError("Missing required command for target percent volume control: wpctl")
+
+        clamped = max(0.0, min(200.0, float(percent)))
+        linear = clamped / 100.0
 
         by_name = {n.name: n for n in snapshot.sinks}
         errors: list[str] = []
@@ -376,29 +376,11 @@ class PipeWireController:
             if node is None:
                 continue
             try:
-                baseline = baselines.get(key)
-                if baseline is None:
-                    baseline = self._get_node_volume_linear(node.id)
-                    baselines[key] = baseline
-
-                gain = math.pow(10.0, desired_db / 20.0)
-                target_linear = max(0.0, baseline * gain)
-                self._run(["wpctl", "set-volume", str(node.id), "--", f"{target_linear:.4f}"])
+                self._run(["wpctl", "set-volume", str(node.id), "--", f"{linear:.4f}"])
             except PipeWireError as exc:
                 errors.append(f"{node.description}: {exc}")
         if errors:
             raise PipeWireError("; ".join(errors[:3]))
-
-    def _get_node_volume_linear(self, node_id: int) -> float:
-        out = self._run(["wpctl", "get-volume", str(node_id)])
-        # Example: "Volume: 0.73"
-        m = re.search(r"Volume:\s*([0-9]*\.?[0-9]+)", out)
-        if not m:
-            raise PipeWireError(f"Could not parse current volume for node {node_id}: {out.strip()}")
-        try:
-            return float(m.group(1))
-        except ValueError as exc:
-            raise PipeWireError(f"Invalid volume value from wpctl for node {node_id}") from exc
 
     def _find_node_by_key(self, key: str, snapshot: PipeWireSnapshot, source: bool) -> Node:
         candidates = snapshot.sources if source else snapshot.sinks

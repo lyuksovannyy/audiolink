@@ -7,6 +7,7 @@ from pathlib import Path
 from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QApplication,
     QAbstractItemView,
     QGroupBox,
     QHBoxLayout,
@@ -15,6 +16,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -26,6 +28,7 @@ from PyQt6.QtWidgets import (
 from media_player import MediaPlayerController
 from pipewire_controller import PipeWireController, PipeWireError, PipeWireSnapshot
 from state_manager import RouteAction, RoutingStateManager
+from app_config import AppConfig, load_config, save_config
 
 
 class PipeWireWorker(QObject):
@@ -35,7 +38,6 @@ class PipeWireWorker(QObject):
     def __init__(self, controller: PipeWireController) -> None:
         super().__init__()
         self._controller = controller
-        self._virtual_mic_baselines: dict[str, float] = {}
 
     @pyqtSlot()
     def poll_snapshot(self) -> None:
@@ -72,16 +74,15 @@ class PipeWireWorker(QObject):
             self.actions_failed.emit("; ".join(errors[:3]))
 
     @pyqtSlot(object)
-    def set_virtual_mic_volume(self, desired_db: object) -> None:
-        if not isinstance(desired_db, (int, float)):
+    def set_virtual_mic_volume(self, desired_percent: object) -> None:
+        if not isinstance(desired_percent, (int, float)):
             return
         try:
             snapshot = self._controller.snapshot()
-            self._controller.apply_target_db_offset_by_keys(
+            self._controller.apply_target_volume_percent_by_keys(
                 [self._controller.virtual_mic_sink_key()],
                 snapshot,
-                float(desired_db),
-                self._virtual_mic_baselines,
+                float(desired_percent),
             )
         except PipeWireError as exc:
             self.actions_failed.emit(str(exc))
@@ -94,7 +95,11 @@ class CheckListWidget(QListWidget):
 
     def mousePressEvent(self, event):  # type: ignore[override]
         item = self.itemAt(event.pos())
-        if item is not None and self.isEnabled():
+        if (
+            item is not None
+            and self.isEnabled()
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
             item.setCheckState(
                 Qt.CheckState.Unchecked
                 if item.checkState() == Qt.CheckState.Checked
@@ -135,6 +140,12 @@ class MainWindow(QMainWindow):
         self._poll_in_flight = False
         self._virtual_mic_sink_key = self.controller.virtual_mic_sink_key()
         self._virtual_mic_source_key = self.controller.virtual_mic_source_key()
+        self._pending_virtual_mic_percent: float = 100.0
+        self._cfg: AppConfig = load_config()
+        self._auto_select_source_keys: set[str] = set(self._cfg.auto_select_sources)
+        self._auto_select_target_keys: set[str] = set(self._cfg.auto_select_targets)
+        self.state.selected_sources.update(self._auto_select_source_keys)
+        self.state.selected_targets.update(self._auto_select_target_keys)
 
         self.setWindowTitle("AudioLink")
         self.resize(800, 600)
@@ -150,8 +161,15 @@ class MainWindow(QMainWindow):
         self._timer.start()
         self._request_poll()
 
+        self._volume_timer = QTimer(self)
+        self._volume_timer.setSingleShot(True)
+        self._volume_timer.setInterval(100)
+        self._volume_timer.timeout.connect(self._flush_virtual_mic_percent)
+
     def closeEvent(self, event):  # type: ignore[override]
         self._timer.stop()
+        self._volume_timer.stop()
+        self._save_config()
 
         # Best-effort cleanup: unlink managed routes on shutdown.
         try:
@@ -191,6 +209,8 @@ class MainWindow(QMainWindow):
 
         self.sources_list = CheckListWidget()
         self.targets_list = CheckListWidget()
+        self.sources_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.targets_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
 
         source_layout.addWidget(self.sources_list)
         target_layout.addWidget(self.targets_list)
@@ -218,16 +238,16 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.auto_streaming_btn)
 
         volume_row = QHBoxLayout()
-        self.volume_down_btn = QPushButton("-5 dB")
+        self.volume_down_btn = QPushButton("-5%")
         self.reset_volume_btn = QPushButton("Reset Volume")
-        self.volume_up_btn = QPushButton("+5 dB")
+        self.volume_up_btn = QPushButton("+5%")
         self.volume_spin = QSpinBox()
-        self.volume_spin.setRange(-30, 100)
-        self.volume_spin.setSuffix(" dB")
-        self.volume_spin.setValue(0)
+        self.volume_spin.setRange(0, 200)
+        self.volume_spin.setSuffix(" %")
+        self.volume_spin.setValue(100)
         self.volume_slider = QSlider(Qt.Orientation.Horizontal)
-        self.volume_slider.setRange(-30, 30)
-        self.volume_slider.setValue(0)
+        self.volume_slider.setRange(0, 200)
+        self.volume_slider.setValue(100)
         volume_row.addWidget(QLabel("Virtual Mic Volume"))
         volume_row.addWidget(self.volume_down_btn)
         volume_row.addWidget(self.reset_volume_btn)
@@ -241,6 +261,12 @@ class MainWindow(QMainWindow):
 
         self.sources_list.itemChanged.connect(self._on_source_item_changed)
         self.targets_list.itemChanged.connect(self._on_target_item_changed)
+        self.sources_list.customContextMenuRequested.connect(
+            lambda pos: self._open_item_menu(self.sources_list, pos, source_list=True)
+        )
+        self.targets_list.customContextMenuRequested.connect(
+            lambda pos: self._open_item_menu(self.targets_list, pos, source_list=False)
+        )
         self.toggle_streaming_btn.toggled.connect(self._toggle_streaming)
         self.clear_capturing_btn.clicked.connect(self._clear_capturing)
         self.clear_streaming_btn.clicked.connect(self._clear_streaming)
@@ -309,7 +335,9 @@ class MainWindow(QMainWindow):
         try:
             self.sources_list.clear()
             for entry in self.state.source_entries():
-                item = QListWidgetItem(entry.label)
+                node = self.state.available_sources.get(entry.key)
+                label = f"{entry.label} [auto]" if entry.key in self._auto_select_source_keys else entry.label
+                item = QListWidgetItem(label)
                 item.setData(self.USER_ROLE, entry.key)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Checked if entry.selected else Qt.CheckState.Unchecked)
@@ -319,7 +347,8 @@ class MainWindow(QMainWindow):
 
             self.targets_list.clear()
             for entry in self.state.target_entries():
-                item = QListWidgetItem(entry.label)
+                label = f"{entry.label} [auto]" if entry.key in self._auto_select_target_keys else entry.label
+                item = QListWidgetItem(label)
                 item.setData(self.USER_ROLE, entry.key)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Checked if entry.selected else Qt.CheckState.Unchecked)
@@ -418,7 +447,7 @@ class MainWindow(QMainWindow):
         self.volume_spin.setValue(target)
 
     def _reset_virtual_mic_volume(self) -> None:
-        self.volume_spin.setValue(0)
+        self.volume_spin.setValue(100)
 
     def _on_volume_spin_changed(self, value: int) -> None:
         slider_value = max(self.volume_slider.minimum(), min(self.volume_slider.maximum(), value))
@@ -426,17 +455,62 @@ class MainWindow(QMainWindow):
             self.volume_slider.blockSignals(True)
             self.volume_slider.setValue(slider_value)
             self.volume_slider.blockSignals(False)
-        self._apply_virtual_mic_db_offset()
+        self._schedule_virtual_mic_percent(float(value))
 
     def _on_volume_slider_changed(self, value: int) -> None:
         if self.volume_spin.value() != value:
             self.volume_spin.blockSignals(True)
             self.volume_spin.setValue(value)
             self.volume_spin.blockSignals(False)
-        self._apply_virtual_mic_db_offset()
+        self._schedule_virtual_mic_percent(float(value))
 
-    def _apply_virtual_mic_db_offset(self) -> None:
-        self.request_set_virtual_mic_volume.emit(float(self.volume_spin.value()))
+    def _schedule_virtual_mic_percent(self, value: float) -> None:
+        self._pending_virtual_mic_percent = value
+        self._volume_timer.start()
+
+    def _flush_virtual_mic_percent(self) -> None:
+        self.request_set_virtual_mic_volume.emit(self._pending_virtual_mic_percent)
+
+    def _open_item_menu(self, widget: QListWidget, pos, source_list: bool) -> None:
+        item = widget.itemAt(pos)
+        if item is None:
+            return
+        key = item.data(self.USER_ROLE)
+        if not isinstance(key, str):
+            return
+
+        auto_set = self._auto_select_source_keys if source_list else self._auto_select_target_keys
+        menu = QMenu(self)
+        copy_name_action = menu.addAction("Copy Name")
+        menu.addSeparator()
+        toggle_label = "Unmark Auto Select" if key in auto_set else "Mark Auto Select"
+        toggle_auto_action = menu.addAction(toggle_label)
+
+        chosen = menu.exec(widget.viewport().mapToGlobal(pos))
+        if chosen is copy_name_action:
+            QApplication.clipboard().setText(key)
+        elif chosen is toggle_auto_action:
+            if key in auto_set:
+                auto_set.remove(key)
+            else:
+                auto_set.add(key)
+                if source_list:
+                    self.state.selected_sources.add(key)
+                else:
+                    self.state.selected_targets.add(key)
+            self._save_config()
+            self._refresh_lists()
+
+    def _save_config(self) -> None:
+        try:
+            save_config(
+                AppConfig(
+                    auto_select_sources=set(self._auto_select_source_keys),
+                    auto_select_targets=set(self._auto_select_target_keys),
+                )
+            )
+        except OSError as exc:
+            self._logger.warning("Failed to save config.json: %s", exc)
 
     def load_media_file(self, file_path: str) -> None:
         path = Path(file_path).expanduser().resolve()
