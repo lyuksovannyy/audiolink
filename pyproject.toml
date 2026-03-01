@@ -9,3 +9,8 @@ dependencies = [
 
 [project.scripts]
 audiolink = "main:main"
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.19.0",
+]
