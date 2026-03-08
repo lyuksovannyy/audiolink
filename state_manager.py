@@ -10,6 +10,7 @@ class ListEntry:
     key: str
     label: str
     available: bool
+    active: bool
     selected: bool
 
 
@@ -33,6 +34,8 @@ class RoutingStateManager:
         self.available_targets: dict[str, Node] = {}
         self._source_labels: dict[str, str] = {}
         self._target_labels: dict[str, str] = {}
+        self._source_match_signatures: dict[str, str] = {}
+        self._source_match_bases: dict[str, str] = {}
 
         # Desired pairs while streaming is enabled. Includes temporarily missing nodes.
         self._desired_pairs: set[tuple[str, str]] = set()
@@ -40,11 +43,53 @@ class RoutingStateManager:
     def update_available(self, sources: list[Node], targets: list[Node]) -> None:
         self.available_sources = {self._source_key(n): n for n in sources}
         self.available_targets = {self._target_key(n): n for n in targets}
+        available_by_signature: dict[str, str] = {}
+        available_by_base: dict[str, str] = {}
+        source_meta: dict[str, tuple[str, str, int | None]] = {}
+        base_counts: dict[str, int] = {}
 
         for key, node in self.available_sources.items():
             self._source_labels[key] = self._label(node)
+            app_name, title, pid = self._source_match_parts(node)
+            source_meta[key] = (app_name, title, pid)
+            base = self._source_base_signature(app_name, title)
+            base_counts[base] = base_counts.get(base, 0) + 1
+        for key, (app_name, title, pid) in source_meta.items():
+            base = self._source_base_signature(app_name, title)
+            signature = self._source_match_signature(app_name, title, pid, base_counts)
+            self._source_match_bases[key] = base
+            self._source_match_signatures[key] = signature
+            available_by_signature.setdefault(signature, key)
+            available_by_base.setdefault(base, key)
         for key, node in self.available_targets.items():
             self._target_labels[key] = self._label(node)
+
+        # If a previously selected/unavailable source reappears with a new key
+        # (for example new stream node id), remap selection by APPNAME - TITLE.
+        remapped_sources: set[str] = set()
+        kept_unavailable_bases: set[str] = set()
+        for key in self.selected_sources:
+            if key in self.available_sources:
+                remapped_sources.add(key)
+                continue
+            old_signature = self._source_match_signatures.get(key)
+            old_base = self._source_match_bases.get(key)
+            if old_signature is None:
+                remapped_sources.add(key)
+                continue
+            replacement = available_by_signature.get(old_signature)
+            if replacement is None and old_base is not None:
+                replacement = available_by_base.get(old_base)
+            if replacement is not None:
+                remapped_sources.add(replacement)
+                continue
+            # Keep only one stale unavailable key per APPNAME - TITLE base signature.
+            base_for_dedupe = old_base or old_signature
+            if base_for_dedupe in kept_unavailable_bases:
+                continue
+            kept_unavailable_bases.add(base_for_dedupe)
+            remapped_sources.add(key)
+        self.selected_sources = remapped_sources
 
         # Keep manual checkbox state unchanged; auto modes are routing-only.
 
@@ -160,9 +205,19 @@ class RoutingStateManager:
         labels: dict[str, str],
     ) -> list[ListEntry]:
         keys = set(available.keys()) | {k for k in selected if k not in available}
-        entries: list[ListEntry] = []
-        for key in sorted(keys, key=str.lower):
+        def sort_key(key: str) -> tuple[int, str]:
             is_available = key in available
+            if not is_available:
+                return (2, key.lower())
+            node = available[key]
+            is_active = (node.state or "").lower() == "running"
+            return (0 if is_active else 1, key.lower())
+
+        entries: list[ListEntry] = []
+        for key in sorted(keys, key=sort_key):
+            node = available.get(key)
+            is_available = node is not None
+            is_active = bool(node is not None and (node.state or "").lower() == "running")
             base_label = labels.get(key, key)
             label = base_label if is_available else f"{base_label} (unavailable)"
             entries.append(
@@ -170,6 +225,7 @@ class RoutingStateManager:
                     key=key,
                     label=label,
                     available=is_available,
+                    active=is_active,
                     selected=key in selected,
                 )
             )
@@ -211,3 +267,31 @@ class RoutingStateManager:
         if node.media_name:
             return node.media_name
         return node.description
+
+    @staticmethod
+    def _source_match_parts(node: Node) -> tuple[str, str, int | None]:
+        app = (node.application_name or "").strip()
+        if not app:
+            if node.process_id is not None:
+                app = f"PID {node.process_id}"
+            else:
+                app = (node.description or node.name).strip()
+        title = (node.media_name or node.description or node.name).strip()
+        return app, title, node.process_id
+
+    @staticmethod
+    def _source_base_signature(app_name: str, title: str) -> str:
+        return f"{app_name} - {title}"
+
+    @classmethod
+    def _source_match_signature(
+        cls,
+        app_name: str,
+        title: str,
+        pid: int | None,
+        base_counts: dict[str, int],
+    ) -> str:
+        base = cls._source_base_signature(app_name, title)
+        if base_counts.get(base, 0) > 1 and pid is not None:
+            return f"{base} - {pid}"
+        return base

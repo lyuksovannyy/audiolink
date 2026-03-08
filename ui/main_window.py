@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import traceback
 from pathlib import Path
 
@@ -142,6 +143,7 @@ class MainWindow(QMainWindow):
     NAME_ROLE = USER_ROLE + 2
     APP_ROLE = USER_ROLE + 3
     APP_MARKER_ROLE = USER_ROLE + 4
+    ITEM_KEY_ROLE = USER_ROLE + 5
     # Internal exclude lists: add exact node keys (node.name values) here.
     EXCLUDED_SOURCE_KEYS: list[str] = [
         "input.audiolink_virtual_mic",
@@ -158,6 +160,7 @@ class MainWindow(QMainWindow):
     request_set_virtual_mic_volume = pyqtSignal(object)
 
     not_available_color = QColor(155, 80, 80)
+    inactive_color = QColor(70, 70, 70)
 
     def __init__(self, controller: PipeWireController, media: MediaPlayerController) -> None:
         super().__init__()
@@ -172,7 +175,9 @@ class MainWindow(QMainWindow):
         self._virtual_mic_source_key = self.controller.virtual_mic_source_key()
         self._pending_virtual_mic_percent: float = 100.0
         self._cfg: AppConfig = load_config()
-        self._auto_select_source_apps: set[str] = set(self._cfg.auto_select_sources)
+        self._auto_select_source_apps: set[str] = {
+            self._normalize_source_app_marker(v) for v in self._cfg.auto_select_sources
+        }
         self._auto_select_source_items: set[str] = set(self._cfg.auto_select_source_items)
         self._auto_select_target_names: set[str] = set(self._cfg.auto_select_targets)
 
@@ -345,18 +350,21 @@ class MainWindow(QMainWindow):
             sources=sources,
             targets=targets,
         )
+        source_title_counts = self._build_source_title_counts()
         for key, node in self.state.available_sources.items():
             app_name = self._source_group_name(node)
-            app_marker = self._source_group_marker(node)
-            marker = self._source_item_marker(
-                app_marker=app_marker,
-                title=(node.media_name or node.description or node.name),
-                raw_name=node.name,
+            title = self._source_item_title(node)
+            runtime_item_key = self._source_item_runtime_key(
+                app_name=app_name,
+                title=title,
+                pid=node.process_id,
+                duplicate_count=source_title_counts.get(self._source_item_base_key(app_name, title), 1),
             )
+            config_item_key = self._source_item_base_key(app_name, title)
             if (
-                app_marker in self._auto_select_source_apps
-                or app_name in self._auto_select_source_apps  # backward compatibility with older config values
-                or marker in self._auto_select_source_items
+                app_name in self._auto_select_source_apps
+                or runtime_item_key in self._auto_select_source_items
+                or config_item_key in self._auto_select_source_items
             ):
                 self.state.selected_sources.add(key)
         for key, node in self.state.available_targets.items():
@@ -382,9 +390,20 @@ class MainWindow(QMainWindow):
             self._refresh_source_tree()
 
             self.targets_list.clear()
-            for entry in self.state.target_entries():
+            target_entries = self.state.target_entries()
+            target_label_counts: dict[str, int] = {}
+            for entry in target_entries:
+                node = self.state.available_targets.get(entry.key)
+                base_label = self._target_display_label(node, entry.label)
+                target_label_counts[base_label] = target_label_counts.get(base_label, 0) + 1
+            for entry in target_entries:
                 node = self.state.available_targets.get(entry.key)
                 label = self._target_display_label(node, entry.label)
+                label = self._append_id_if_duplicate(
+                    label=label,
+                    node_id=(node.id if node is not None else None),
+                    duplicate_count=target_label_counts.get(label, 1),
+                )
                 if node is not None and node.name in self._auto_select_target_names:
                     label = f"{label} [auto]"
                 item = QListWidgetItem(label)
@@ -395,6 +414,8 @@ class MainWindow(QMainWindow):
                 item.setCheckState(Qt.CheckState.Checked if entry.selected else Qt.CheckState.Unchecked)
                 if not entry.available:
                     item.setBackground(self.not_available_color)
+                elif not entry.active:
+                    item.setBackground(self.inactive_color)
                 self.targets_list.addItem(item)
         finally:
             self._updating_lists = False
@@ -404,31 +425,46 @@ class MainWindow(QMainWindow):
 
     def _refresh_source_tree(self) -> None:
         self.sources_list.clear()
-        grouped: dict[str, list[tuple[str, str, bool, bool]]] = {}
+        source_title_counts = self._build_source_title_counts()
+        grouped: dict[str, list[tuple[str, str, bool, bool, bool]]] = {}
         group_labels: dict[str, str] = {}
         for entry in self.state.source_entries():
             node = self.state.available_sources.get(entry.key)
             app_name = self._source_group_name(node) if node is not None else "Unavailable"
             app_marker = self._source_group_marker(node) if node is not None else f"missing:{entry.key}"
-            grouped.setdefault(app_marker, []).append((entry.key, entry.label, entry.available, entry.selected))
+            grouped.setdefault(app_marker, []).append((entry.key, entry.label, entry.available, entry.selected, entry.active))
             group_labels[app_marker] = app_name
 
         for app_marker in sorted(grouped.keys(), key=str.lower):
             app_name = group_labels.get(app_marker, app_marker)
-            group_items = sorted(grouped[app_marker], key=lambda x: x[1].lower())
+            group_items = sorted(
+                grouped[app_marker],
+                key=lambda x: (0 if x[4] else 1, x[1].lower()),
+            )
+            child_label_counts: dict[str, int] = {}
+            for _key, child_label, _available, _selected, _active in group_items:
+                child_label_counts[child_label] = child_label_counts.get(child_label, 0) + 1
             if len(group_items) == 1:
-                key, child_label, available, selected = group_items[0]
+                key, child_label, available, selected, active = group_items[0]
                 node = self.state.available_sources.get(key)
-                label = f"{app_name} - {child_label}" if child_label and child_label != app_name else app_name
-                item_marker = self._source_item_marker(
-                    app_marker=app_marker,
-                    title=(child_label or app_name),
-                    raw_name=(node.name if node is not None else key),
+                title = self._source_item_title(node, fallback=(child_label or app_name))
+                runtime_item_key = self._source_item_runtime_key(
+                    app_name=app_name,
+                    title=title,
+                    pid=(node.process_id if node is not None else None),
+                    duplicate_count=source_title_counts.get(self._source_item_base_key(app_name, title), 1),
                 )
+                config_item_key = self._source_item_base_key(app_name, title)
+                display_child = self._append_id_if_duplicate(
+                    label=child_label,
+                    node_id=(node.id if node is not None else None),
+                    duplicate_count=child_label_counts.get(child_label, 1),
+                )
+                label = f"{app_name} - {display_child}" if child_label and child_label != app_name else app_name
                 if (
-                    app_marker in self._auto_select_source_apps
-                    or app_name in self._auto_select_source_apps  # backward compatibility with older config values
-                    or item_marker in self._auto_select_source_items
+                    app_name in self._auto_select_source_apps
+                    or runtime_item_key in self._auto_select_source_items
+                    or config_item_key in self._auto_select_source_items
                 ):
                     label = f"{label} [auto]"
                 leaf = QTreeWidgetItem([label])
@@ -437,18 +473,17 @@ class MainWindow(QMainWindow):
                 leaf.setData(0, self.NAME_ROLE, node.name if node is not None else key)
                 leaf.setData(0, self.APP_ROLE, app_name)
                 leaf.setData(0, self.APP_MARKER_ROLE, app_marker)
+                leaf.setData(0, self.ITEM_KEY_ROLE, runtime_item_key)
                 leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 leaf.setCheckState(0, Qt.CheckState.Checked if selected else Qt.CheckState.Unchecked)
                 if not available:
                     leaf.setBackground(0, self.not_available_color)
+                elif not active:
+                    leaf.setBackground(0, self.inactive_color)
                 self.sources_list.addTopLevelItem(leaf)
                 continue
 
-            parent_label = (
-                f"{app_name} [auto]"
-                if (app_marker in self._auto_select_source_apps or app_name in self._auto_select_source_apps)
-                else app_name
-            )
+            parent_label = f"{app_name} [auto]" if app_name in self._auto_select_source_apps else app_name
             parent = QTreeWidgetItem([parent_label])
             parent.setData(0, self.USER_ROLE, app_marker)
             parent.setData(0, self.TITLE_ROLE, app_name)
@@ -459,14 +494,29 @@ class MainWindow(QMainWindow):
             self.sources_list.addTopLevelItem(parent)
 
             child_states: list[Qt.CheckState] = []
-            for key, label, available, selected in group_items:
+            for key, label, available, selected, active in group_items:
                 node = self.state.available_sources.get(key)
-                item_marker = self._source_item_marker(
-                    app_marker=app_marker,
-                    title=label,
-                    raw_name=(node.name if node is not None else key),
+                title = self._source_item_title(node, fallback=label)
+                runtime_item_key = self._source_item_runtime_key(
+                    app_name=app_name,
+                    title=title,
+                    pid=(node.process_id if node is not None else None),
+                    duplicate_count=source_title_counts.get(self._source_item_base_key(app_name, title), 1),
                 )
-                child_label = f"{label} [auto]" if item_marker in self._auto_select_source_items else label
+                config_item_key = self._source_item_base_key(app_name, title)
+                child_label = (
+                    f"{label} [auto]"
+                    if (
+                        runtime_item_key in self._auto_select_source_items
+                        or config_item_key in self._auto_select_source_items
+                    )
+                    else label
+                )
+                child_label = self._append_id_if_duplicate(
+                    label=child_label,
+                    node_id=(node.id if node is not None else None),
+                    duplicate_count=child_label_counts.get(label, 1),
+                )
                 child = QTreeWidgetItem([label])
                 child.setData(0, self.USER_ROLE, key)
                 child.setData(0, self.TITLE_ROLE, label)
@@ -474,12 +524,15 @@ class MainWindow(QMainWindow):
                 child.setData(0, self.NAME_ROLE, node.name if node is not None else key)
                 child.setData(0, self.APP_ROLE, app_name)
                 child.setData(0, self.APP_MARKER_ROLE, app_marker)
+                child.setData(0, self.ITEM_KEY_ROLE, runtime_item_key)
                 child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 state = Qt.CheckState.Checked if selected else Qt.CheckState.Unchecked
                 child.setCheckState(0, state)
                 child_states.append(state)
                 if not available:
                     child.setBackground(0, self.not_available_color)
+                elif not active:
+                    child.setBackground(0, self.inactive_color)
                 parent.addChild(child)
 
             if child_states and all(s == Qt.CheckState.Checked for s in child_states):
@@ -671,17 +724,20 @@ class MainWindow(QMainWindow):
         app_marker = item.data(0, self.APP_MARKER_ROLE)
         if not isinstance(app_marker, str):
             app_marker = app_name
+        item_runtime_key = item.data(0, self.ITEM_KEY_ROLE)
+        if not isinstance(item_runtime_key, str):
+            item_runtime_key = self._source_item_base_key(app_name, title)
+        item_config_key = self._source_item_config_key(item_runtime_key)
         auto_set = self._auto_select_source_apps
         auto_item_set = self._auto_select_source_items
         menu = QMenu(self)
         copy_name_action = menu.addAction("Copy Name")
         menu.addSeparator()
-        marker_key = app_marker
-        item_marker = self._source_item_marker(app_marker=app_marker, title=title, raw_name=raw_name)
+        marker_key = app_name
         if is_group:
-            marked = marker_key in auto_set or app_name in auto_set
+            marked = marker_key in auto_set
         else:
-            marked = item_marker in auto_item_set
+            marked = item_runtime_key in auto_item_set or item_config_key in auto_item_set
         toggle_label = "Unmark Auto Select" if marked else "Mark Auto Select"
         toggle_auto_action = menu.addAction(toggle_label)
 
@@ -694,13 +750,12 @@ class MainWindow(QMainWindow):
                     auto_set.remove(marker_key)
                 else:
                     auto_set.add(marker_key)
-                # Cleanup legacy value if present to avoid dual markers in config.
-                auto_set.discard(app_name)
             else:
-                if item_marker in auto_item_set:
-                    auto_item_set.remove(item_marker)
+                if item_runtime_key in auto_item_set or item_config_key in auto_item_set:
+                    auto_item_set.discard(item_runtime_key)
+                    auto_item_set.discard(item_config_key)
                 else:
-                    auto_item_set.add(item_marker)
+                    auto_item_set.add(item_runtime_key)
                     self.state.selected_sources.add(key)
             if is_group:
                 for child_key in group_child_keys:
@@ -748,7 +803,7 @@ class MainWindow(QMainWindow):
             save_config(
                 AppConfig(
                     auto_select_sources=set(self._auto_select_source_apps),
-                    auto_select_source_items=set(self._auto_select_source_items),
+                    auto_select_source_items={self._source_item_config_key(v) for v in self._auto_select_source_items},
                     auto_select_targets=set(self._auto_select_target_names),
                 )
             )
@@ -794,9 +849,54 @@ class MainWindow(QMainWindow):
         return fallback_label
 
     @staticmethod
-    def _source_item_marker(app_marker: str, title: str, raw_name: str) -> str:
-        return "|".join([app_marker.strip(), title.strip(), raw_name.strip()])
+    def _normalize_source_app_marker(value: str) -> str:
+        if value.startswith("app:"):
+            app = value[4:]
+            if "|pid:" in app:
+                app = app.split("|pid:", 1)[0]
+            return app.strip() or value
+        return value
 
+    def _build_source_title_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for node in self.state.available_sources.values():
+            app_name = self._source_group_name(node)
+            title = self._source_item_title(node)
+            base = self._source_item_base_key(app_name, title)
+            counts[base] = counts.get(base, 0) + 1
+        return counts
+
+    @staticmethod
+    def _source_item_title(node, fallback: str | None = None) -> str:
+        if node is None:
+            return fallback or "Unknown"
+        title = (node.media_name or node.description or node.name).strip()
+        return title or (fallback or node.name)
+
+    @staticmethod
+    def _source_item_base_key(app_name: str, title: str) -> str:
+        return f"{app_name.strip()} - {title.strip()}"
+
+    @staticmethod
+    def _source_item_runtime_key(app_name: str, title: str, pid: int | None, duplicate_count: int) -> str:
+        base = MainWindow._source_item_base_key(app_name, title)
+        if duplicate_count > 1 and pid is not None:
+            return f"{app_name.strip()} - {pid}/{title.strip()}"
+        return base
+
+    @staticmethod
+    def _source_item_config_key(item_key: str) -> str:
+        m = re.match(r"^(.*)\s-\s(\d+)\/(.+)$", item_key)
+        if not m:
+            return item_key
+        app_name, _pid, title = m.groups()
+        return f"{app_name.strip()} - {title.strip()}"
+
+    @staticmethod
+    def _append_id_if_duplicate(label: str, node_id: int | None, duplicate_count: int) -> str:
+        if duplicate_count > 1 and node_id is not None:
+            return f"{label} ({node_id})"
+        return label
     def load_media_file(self, file_path: str) -> None:
         path = Path(file_path).expanduser().resolve()
         self.media.load_file(str(path))

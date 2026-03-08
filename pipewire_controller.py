@@ -28,6 +28,7 @@ class Node:
     description: str
     application_name: str
     media_name: str
+    state: str
     media_class: str
     process_id: int | None
     ports: List[Port] = field(default_factory=list)
@@ -144,6 +145,7 @@ class PipeWireController:
                     or node_name
                 )
                 media_class = props.get("media.class", "")
+                state = str(info.get("state") or "").lower()
                 pid_raw = props.get("application.process.id")
                 try:
                     pid = int(pid_raw) if pid_raw is not None else None
@@ -156,6 +158,7 @@ class PipeWireController:
                     description=str(desc),
                     application_name=str(props.get("application.name", "")),
                     media_name=str(props.get("media.name") or ""),
+                    state=state,
                     media_class=str(media_class),
                     process_id=pid,
                 )
